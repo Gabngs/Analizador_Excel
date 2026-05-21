@@ -103,7 +103,8 @@ class ExcelAnalyzer:
             sheets_info: Dict[str, List[str]] = {}
             for label, path in [('file1', file1_path), ('file2', file2_path)]:
                 try:
-                    sheets_info[label] = pd.ExcelFile(path).sheet_names
+                    with pd.ExcelFile(path) as xls:
+                        sheets_info[label] = xls.sheet_names
                 except Exception:
                     sheets_info[label] = []
 
@@ -857,9 +858,26 @@ def compare():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:
+        # Dar tiempo para que se liberen los recursos del archivo
+        import time
+        import gc
+        gc.collect()  # Forzar recolección de basura para cerrar referencias
+        time.sleep(0.1)  # Pequeño delay para permitir que Windows libere el archivo
+        
         for p in (p1, p2):
             if os.path.exists(p):
-                os.remove(p)
+                # Intentar eliminar con reintentos en caso de bloqueo temporal
+                max_attempts = 3
+                for attempt in range(max_attempts):
+                    try:
+                        os.remove(p)
+                        break
+                    except PermissionError:
+                        if attempt < max_attempts - 1:
+                            time.sleep(0.5)  # Esperar antes de reintentar
+                        else:
+                            # Si falla después de todos los intentos, registrar pero no fallar
+                            print(f"Advertencia: No se pudo eliminar {p}")
 
 
 @app.route('/download-report', methods=['GET'])
