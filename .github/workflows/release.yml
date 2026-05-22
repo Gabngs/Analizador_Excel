@@ -67,14 +67,21 @@ jobs:
       - name: Display structure of downloaded files
         run: ls -R ./artifacts
 
+      - name: Prepare release files
+        run: |
+          mkdir -p ./release-files
+          cp ./artifacts/ExcelAnalyzer-linux-x64/ExcelAnalyzer ./release-files/ExcelAnalyzer-linux-x64
+          cp ./artifacts/ExcelAnalyzer-windows-x64.exe/ExcelAnalyzer.exe ./release-files/ExcelAnalyzer-windows-x64.exe
+          cp ./artifacts/ExcelAnalyzer-macos-x64/ExcelAnalyzer ./release-files/ExcelAnalyzer-macos-x64
+          chmod +x ./release-files/ExcelAnalyzer-linux-x64
+          chmod +x ./release-files/ExcelAnalyzer-macos-x64
+          ls -lh ./release-files/
+
       - name: Create Release
         id: create_release
         uses: softprops/action-gh-release@v1
         with:
-          files: |
-            ./artifacts/ExcelAnalyzer-linux-x64/ExcelAnalyzer
-            ./artifacts/ExcelAnalyzer-windows-x64.exe/ExcelAnalyzer.exe
-            ./artifacts/ExcelAnalyzer-macos-x64/ExcelAnalyzer
+          files: ./release-files/*
           draft: false
           prerelease: false
           generate_release_notes: true
