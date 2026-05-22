@@ -1,4 +1,6 @@
 import os
+import re
+import sys
 import json
 import sqlite3
 import tempfile
@@ -10,6 +12,16 @@ import numpy as np
 from flask import Flask, render_template_string, request, jsonify, Response
 from werkzeug.utils import secure_filename
 import hashlib
+
+# Fix UnicodeEncodeError on Windows consoles that use cp1252 encoding
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+# pandas dtype aliases treated as equivalent for comparison purposes
+_DTYPE_EQUIV: Dict[str, str] = {'str': 'object', 'string': 'object'}
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
@@ -28,59 +40,46 @@ class ExcelAnalyzer:
         self.db_path = os.path.join(temp_dir, 'analyzer.db')
         self._init_db()
     
-    def _preprocess_dataframe(self, df: pd.DataFrame, file_path: str = '') -> pd.DataFrame:
+    def _preprocess_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         """Preprocesa el DataFrame para corregir problemas comunes."""
-        # Detectar si la primera fila contiene los encabezados reales
-        if len(df) > 0 and len([col for col in df.columns if 'Unnamed' in str(col)]) > len(df.columns) * 0.5:
-            # Más del 50% de columnas son "Unnamed" - probablemente encabezados en fila 1
-            # Intentar recargar solo si el archivo existe
-            if file_path and os.path.exists(file_path):
-                try:
-                    df = pd.read_excel(file_path, header=0)
-                    # Verificar si la primera fila parece ser un encabezado
-                    first_row = df.iloc[0] if len(df) > 0 else None
-                    if first_row is not None:
-                        # Si la primera fila tiene texto descriptivo, usarla como encabezado
-                        if all(isinstance(v, str) or pd.isna(v) for v in first_row[:10]):
-                            df.columns = df.iloc[0].fillna('').astype(str)
-                            df = df.iloc[1:].reset_index(drop=True)
-                except Exception as e:
-                    print(f"⚠️ No se pudo recargar archivo, usando DataFrame actual: {e}")
-                    pass
-            else:
-                # Si no hay file_path o no existe, intentar usar la primera fila como encabezados
-                try:
-                    if len(df) > 0:
-                        first_row = df.iloc[0]
-                        # Si la primera fila parece ser encabezados (texto descriptivo)
-                        if all(isinstance(v, str) or pd.isna(v) for v in first_row[:10]):
-                            df.columns = df.iloc[0].fillna('').astype(str)
-                            df = df.iloc[1:].reset_index(drop=True)
-                except Exception as e:
-                    print(f"⚠️ Error al procesar encabezados: {e}")
-                    pass
-        
-        # Limpiar nombres de columnas
+        # Detect when pandas read a title row as column names (>50% "Unnamed" cols)
+        # and the real headers are in the first data row.
+        if len(df) > 0 and sum(1 for c in df.columns if 'Unnamed' in str(c)) > len(df.columns) * 0.5:
+            try:
+                first_row = df.iloc[0]
+                if all(isinstance(v, str) or pd.isna(v) for v in first_row[:10]):
+                    df = df.copy()
+                    df.columns = first_row.fillna('').astype(str)
+                    df = df.iloc[1:].reset_index(drop=True)
+            except Exception as e:
+                print(f"Warning: could not promote first row to header: {e}")
+
+        # Strip timestamps embedded in column names and trim whitespace
         new_cols = []
+        seen: Dict[str, int] = {}
         for col in df.columns:
             col_str = str(col).strip()
-            # Eliminar timestamps del nombre de columna
-            import re
             col_str = re.sub(r'\d{4}-\d{2}-\d{2}[\s_]\d{2}[:-]\d{2}[:-]\d{2}', '', col_str)
             col_str = re.sub(r'\d{4}-\d{2}-\d{2}', '', col_str)
             col_str = col_str.strip(' -_,')
             if not col_str:
                 col_str = f'COL_{len(new_cols)}'
+            # Deduplicate column names
+            if col_str in seen:
+                seen[col_str] += 1
+                col_str = f'{col_str}_{seen[col_str]}'
+            else:
+                seen[col_str] = 0
             new_cols.append(col_str)
         df.columns = new_cols
-        
-        # Normalizar espacios en columnas de texto
+
+        # Normalize leading/trailing whitespace in text columns
         for col in df.select_dtypes(include=['object']).columns:
             try:
                 df[col] = df[col].apply(lambda x: x.strip() if isinstance(x, str) else x)
             except Exception:
                 pass
-        
+
         return df
 
     def _init_db(self):
@@ -135,8 +134,7 @@ class ExcelAnalyzer:
     def analyze_single_file(self, file_path: str) -> Dict[str, Any]:
         try:
             df = pd.read_excel(file_path)
-            # Solo pasar file_path si el archivo aún existe
-            df = self._preprocess_dataframe(df, file_path if os.path.exists(file_path) else '')
+            df = self._preprocess_dataframe(df)
 
             metrics = {
                 'file_name': Path(file_path).name,
@@ -182,16 +180,14 @@ class ExcelAnalyzer:
 
     def compare_files(
         self, file1_path: str, file2_path: str, case_sensitive: bool = True,
-        sort_columns: List[str] = None, auto_sort: bool = True, ignore_type_diff: bool = False
+        sort_columns: List[str] = None, auto_sort: bool = True, ignore_type_diff: bool = True
     ) -> Dict[str, Any]:
         try:
             df1 = pd.read_excel(file1_path)
             df2 = pd.read_excel(file2_path)
-            
-            # Preprocesar ambos DataFrames
-            # Solo pasar file_path si el archivo aún existe
-            df1 = self._preprocess_dataframe(df1, file1_path if os.path.exists(file1_path) else '')
-            df2 = self._preprocess_dataframe(df2, file2_path if os.path.exists(file2_path) else '')
+
+            df1 = self._preprocess_dataframe(df1)
+            df2 = self._preprocess_dataframe(df2)
 
             sheets_info: Dict[str, List[str]] = {}
             for label, path in [('file1', file1_path), ('file2', file2_path)]:
@@ -277,9 +273,12 @@ class ExcelAnalyzer:
     def _get_type_changes(self, df1, df2, common_cols) -> Dict[str, Any]:
         changes = {}
         for col in common_cols:
-            t1, t2 = str(df1[col].dtype), str(df2[col].dtype)
+            t1_raw, t2_raw = str(df1[col].dtype), str(df2[col].dtype)
+            # Normalize equivalent dtype names before comparing
+            t1 = _DTYPE_EQUIV.get(t1_raw, t1_raw)
+            t2 = _DTYPE_EQUIV.get(t2_raw, t2_raw)
             if t1 != t2:
-                changes[col] = {'from': t1, 'to': t2}
+                changes[col] = {'from': t1_raw, 'to': t2_raw}
         return changes
 
     # ------------------------------------------------------------------
@@ -347,13 +346,13 @@ class ExcelAnalyzer:
 
         if isinstance(val, str):
             s = val.strip()
-            # Si ignore_type_diff está activo, intentar convertir strings numéricos a float
+            # Strip trailing decimal dot — Excel export artifact: '12345.' → '12345'
+            if s.endswith('.') and s[:-1].lstrip('-').isdigit():
+                s = s[:-1]
             if ignore_type_diff:
                 try:
-                    # Intentar convertir a número
                     return float(s)
                 except (ValueError, TypeError):
-                    # Si no es número, devolver string normalizado
                     return s if case_sensitive else s.lower()
             return s if case_sensitive else s.lower()
 
@@ -1149,8 +1148,8 @@ def get_common_columns():
         df1 = pd.read_excel(p1)
         df2 = pd.read_excel(p2)
 
-        df1 = analyzer._preprocess_dataframe(df1, '')
-        df2 = analyzer._preprocess_dataframe(df2, '')
+        df1 = analyzer._preprocess_dataframe(df1)
+        df2 = analyzer._preprocess_dataframe(df2)
         
         common_cols = sorted(set(df1.columns) & set(df2.columns))
         suggested_cols = analyzer._detect_sort_columns(df1, df2)

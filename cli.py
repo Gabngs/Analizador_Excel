@@ -125,9 +125,10 @@ def compare_command(args):
     
     if data_diff['column_differences']:
         print(f"\n  Columnas con diferencias ({len(data_diff['column_differences'])}):")
-        for col, count in sorted(data_diff['column_differences'].items(), 
+        for col, count in sorted(data_diff['column_differences'].items(),
                                 key=lambda x: x[1], reverse=True):
-            pct = (count / data_diff['rows_with_differences'] * 100) if data_diff['rows_with_differences'] > 0 else 0
+            rows_compared = data_diff.get('rows_compared', 0)
+            pct = (count / rows_compared * 100) if rows_compared > 0 else 0
             print(f"     - {col}: {count} celdas diferentes ({pct:.1f}%)")
     else:
         print(f"\n  ✅ Los datos son idénticos en columnas comunes")
