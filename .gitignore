@@ -48,6 +48,23 @@ Thumbs.db
 # Logs
 *.log
 
+# PyInstaller
+*.spec.bak
+*.manifest
+*.spec~
+
+# Archivos de prueba Excel
+test_files/
+*.xlsx
+*.xls
+*.csv
+!generate_test_files.py
+
+# Archivos temporales
+*.tmp
+temp/
+tmp/
+
 # Temporary files
 *.tmp
 *.temp
