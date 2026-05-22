@@ -2,6 +2,7 @@ import os
 import json
 import sqlite3
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Dict, List, Any
 import pandas as pd
@@ -12,7 +13,8 @@ import hashlib
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
-app.config['UPLOAD_FOLDER'] = tempfile.gettempdir()
+# Convertir la ruta corta de Windows a ruta larga para evitar problemas
+app.config['UPLOAD_FOLDER'] = os.path.realpath(tempfile.gettempdir())
 ALLOWED_EXTENSIONS = {'xlsx', 'xls', 'csv'}
 
 MAX_DIFF_ROWS_STORED = 2000   # rows kept in SQLite / download report
@@ -21,16 +23,99 @@ MAX_DIFF_ROWS_UI = 200        # rows shown inline in the browser
 
 class ExcelAnalyzer:
     def __init__(self):
-        self.db_path = os.path.join(tempfile.gettempdir(), 'analyzer.db')
+        # Usar ruta completa para evitar problemas con rutas cortas de Windows
+        temp_dir = os.path.realpath(tempfile.gettempdir())
+        self.db_path = os.path.join(temp_dir, 'analyzer.db')
         self._init_db()
+    
+    def _preprocess_dataframe(self, df: pd.DataFrame, file_path: str = '') -> pd.DataFrame:
+        """Preprocesa el DataFrame para corregir problemas comunes."""
+        # Detectar si la primera fila contiene los encabezados reales
+        if len(df) > 0 and len([col for col in df.columns if 'Unnamed' in str(col)]) > len(df.columns) * 0.5:
+            # Más del 50% de columnas son "Unnamed" - probablemente encabezados en fila 1
+            # Intentar recargar solo si el archivo existe
+            if file_path and os.path.exists(file_path):
+                try:
+                    df = pd.read_excel(file_path, header=0)
+                    # Verificar si la primera fila parece ser un encabezado
+                    first_row = df.iloc[0] if len(df) > 0 else None
+                    if first_row is not None:
+                        # Si la primera fila tiene texto descriptivo, usarla como encabezado
+                        if all(isinstance(v, str) or pd.isna(v) for v in first_row[:10]):
+                            df.columns = df.iloc[0].fillna('').astype(str)
+                            df = df.iloc[1:].reset_index(drop=True)
+                except Exception as e:
+                    print(f"⚠️ No se pudo recargar archivo, usando DataFrame actual: {e}")
+                    pass
+            else:
+                # Si no hay file_path o no existe, intentar usar la primera fila como encabezados
+                try:
+                    if len(df) > 0:
+                        first_row = df.iloc[0]
+                        # Si la primera fila parece ser encabezados (texto descriptivo)
+                        if all(isinstance(v, str) or pd.isna(v) for v in first_row[:10]):
+                            df.columns = df.iloc[0].fillna('').astype(str)
+                            df = df.iloc[1:].reset_index(drop=True)
+                except Exception as e:
+                    print(f"⚠️ Error al procesar encabezados: {e}")
+                    pass
+        
+        # Limpiar nombres de columnas
+        new_cols = []
+        for col in df.columns:
+            col_str = str(col).strip()
+            # Eliminar timestamps del nombre de columna
+            import re
+            col_str = re.sub(r'\d{4}-\d{2}-\d{2}[\s_]\d{2}[:-]\d{2}[:-]\d{2}', '', col_str)
+            col_str = re.sub(r'\d{4}-\d{2}-\d{2}', '', col_str)
+            col_str = col_str.strip(' -_,')
+            if not col_str:
+                col_str = f'COL_{len(new_cols)}'
+            new_cols.append(col_str)
+        df.columns = new_cols
+        
+        # Normalizar espacios en columnas de texto
+        for col in df.select_dtypes(include=['object']).columns:
+            try:
+                df[col] = df[col].apply(lambda x: x.strip() if isinstance(x, str) else x)
+            except Exception:
+                pass
+        
+        return df
 
     def _init_db(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.execute(
-            'CREATE TABLE IF NOT EXISTS comparisons (id TEXT PRIMARY KEY, data TEXT)'
-        )
-        conn.commit()
-        conn.close()
+        """Inicializa la base de datos SQLite, verificando que la tabla existe."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute(
+                'CREATE TABLE IF NOT EXISTS comparisons (id TEXT PRIMARY KEY, data TEXT)'
+            )
+            conn.commit()
+            conn.close()
+            print(f"✅ Base de datos inicializada: {self.db_path}")
+        except Exception as e:
+            print(f"❌ Error al inicializar base de datos: {e}")
+            raise
+    
+    def _ensure_db(self):
+        """Verifica que la base de datos y la tabla existan antes de usarlas."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            # Verificar si la tabla existe
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='comparisons'"
+            )
+            if cursor.fetchone() is None:
+                # La tabla no existe, crearla
+                conn.execute(
+                    'CREATE TABLE comparisons (id TEXT PRIMARY KEY, data TEXT)'
+                )
+                conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"⚠️ Error al verificar base de datos: {e}")
+            # Intentar recrear la base de datos
+            self._init_db()
 
     def get_sheet_info(self, file_path: str) -> Dict[str, Any]:
         try:
@@ -50,6 +135,8 @@ class ExcelAnalyzer:
     def analyze_single_file(self, file_path: str) -> Dict[str, Any]:
         try:
             df = pd.read_excel(file_path)
+            # Solo pasar file_path si el archivo aún existe
+            df = self._preprocess_dataframe(df, file_path if os.path.exists(file_path) else '')
 
             metrics = {
                 'file_name': Path(file_path).name,
@@ -94,11 +181,17 @@ class ExcelAnalyzer:
     # ------------------------------------------------------------------
 
     def compare_files(
-        self, file1_path: str, file2_path: str, case_sensitive: bool = True
+        self, file1_path: str, file2_path: str, case_sensitive: bool = True,
+        sort_columns: List[str] = None, auto_sort: bool = True, ignore_type_diff: bool = False
     ) -> Dict[str, Any]:
         try:
             df1 = pd.read_excel(file1_path)
             df2 = pd.read_excel(file2_path)
+            
+            # Preprocesar ambos DataFrames
+            # Solo pasar file_path si el archivo aún existe
+            df1 = self._preprocess_dataframe(df1, file1_path if os.path.exists(file1_path) else '')
+            df2 = self._preprocess_dataframe(df2, file2_path if os.path.exists(file2_path) else '')
 
             sheets_info: Dict[str, List[str]] = {}
             for label, path in [('file1', file1_path), ('file2', file2_path)]:
@@ -118,7 +211,10 @@ class ExcelAnalyzer:
                     )
 
             schema_diff = self._compare_schemas(df1, df2)
-            data_diff = self._compare_data(df1, df2, case_sensitive)
+            # Si ignore_type_diff está activo, no mostrar cambios de tipo
+            if ignore_type_diff:
+                schema_diff['type_changes'] = {}
+            data_diff = self._compare_data(df1, df2, case_sensitive, sort_columns, auto_sort, ignore_type_diff)
 
             # Unique ID using content hash so the same files produce the same key
             comp_id = hashlib.md5(
@@ -132,6 +228,7 @@ class ExcelAnalyzer:
                 'file2': Path(file2_path).name,
                 'timestamp': pd.Timestamp.now().isoformat(),
                 'case_sensitive': case_sensitive,
+                'ignore_type_diff': ignore_type_diff,
                 'warnings': warnings,
                 'sheets_info': sheets_info,
                 'schema_differences': schema_diff,
@@ -146,6 +243,9 @@ class ExcelAnalyzer:
                 },
             }
 
+            # Asegurar que la base de datos y tabla existen
+            self._ensure_db()
+            
             conn = sqlite3.connect(self.db_path)
             conn.execute(
                 'INSERT OR REPLACE INTO comparisons VALUES (?, ?)',
@@ -183,10 +283,62 @@ class ExcelAnalyzer:
         return changes
 
     # ------------------------------------------------------------------
+    # Detect candidate columns for sorting
+    # ------------------------------------------------------------------
+
+    def _detect_sort_columns(self, df1: pd.DataFrame, df2: pd.DataFrame) -> List[str]:
+        """Detecta automáticamente columnas candidatas para ordenar antes de comparar.
+        Prioriza: ID, código, fecha, nombre, índice único.
+        """
+        common_cols = list(set(df1.columns) & set(df2.columns))
+        if not common_cols:
+            return []
+
+        candidates = []
+        
+        # Palabras clave que indican columnas de identificación/ordenamiento
+        key_patterns = ['id', 'codigo', 'code', 'clave', 'key', 'index', 'indice',
+                       'num', 'numero', 'number', 'folio', 'orden', 'order']
+        
+        # Buscar columnas con nombres que sugieran identificadores
+        for col in common_cols:
+            col_lower = str(col).lower()
+            if any(pattern in col_lower for pattern in key_patterns):
+                # Verificar que la columna sea útil para ordenar (sin muchos duplicados)
+                try:
+                    df1_unique_ratio = df1[col].nunique() / len(df1) if len(df1) > 0 else 0
+                    df2_unique_ratio = df2[col].nunique() / len(df2) if len(df2) > 0 else 0
+                    # Si tiene al menos 50% de valores únicos, es buena candidata
+                    if df1_unique_ratio >= 0.5 and df2_unique_ratio >= 0.5:
+                        candidates.append(col)
+                except (TypeError, ValueError, KeyError):
+                    pass
+        
+        # Si no encontramos candidatos por nombre, buscar columnas con alta cardinalidad
+        if not candidates:
+            for col in common_cols:
+                try:
+                    # Verificar que sea ordenable (numérico, string, o datetime)
+                    if df1[col].dtype in ['int64', 'float64', 'object', 'datetime64[ns]']:
+                        df1_unique_ratio = df1[col].nunique() / len(df1) if len(df1) > 0 else 0
+                        df2_unique_ratio = df2[col].nunique() / len(df2) if len(df2) > 0 else 0
+                        if df1_unique_ratio >= 0.7 and df2_unique_ratio >= 0.7:
+                            candidates.append((col, df1_unique_ratio))
+                except (TypeError, ValueError, KeyError):
+                    pass
+            
+            # Ordenar por cardinalidad y tomar las mejores
+            if candidates and isinstance(candidates[0], tuple):
+                candidates.sort(key=lambda x: x[1], reverse=True)
+                candidates = [col for col, _ in candidates[:3]]
+        
+        return candidates[:3]  # Máximo 3 columnas para ordenar
+
+    # ------------------------------------------------------------------
     # Value normalisation
     # ------------------------------------------------------------------
 
-    def _normalize_value(self, val, case_sensitive: bool = True):
+    def _normalize_value(self, val, case_sensitive: bool = True, ignore_type_diff: bool = False):
         try:
             if pd.isna(val):
                 return None
@@ -195,6 +347,14 @@ class ExcelAnalyzer:
 
         if isinstance(val, str):
             s = val.strip()
+            # Si ignore_type_diff está activo, intentar convertir strings numéricos a float
+            if ignore_type_diff:
+                try:
+                    # Intentar convertir a número
+                    return float(s)
+                except (ValueError, TypeError):
+                    # Si no es número, devolver string normalizado
+                    return s if case_sensitive else s.lower()
             return s if case_sensitive else s.lower()
 
         if isinstance(val, (int, float, np.integer, np.floating)):
@@ -223,15 +383,44 @@ class ExcelAnalyzer:
     # ------------------------------------------------------------------
 
     def _compare_data(
-        self, df1: pd.DataFrame, df2: pd.DataFrame, case_sensitive: bool = True
+        self, df1: pd.DataFrame, df2: pd.DataFrame, case_sensitive: bool = True,
+        sort_columns: List[str] = None, auto_sort: bool = True, ignore_type_diff: bool = False
     ) -> Dict[str, Any]:
         common_cols = sorted(set(df1.columns) & set(df2.columns))
 
         if not common_cols:
             return {'error': 'No hay columnas comunes para comparar'}
 
-        df1_c = df1[common_cols].reset_index(drop=True)
-        df2_c = df2[common_cols].reset_index(drop=True)
+        df1_c = df1[common_cols].copy()
+        df2_c = df2[common_cols].copy()
+        
+        # Determinar columnas para ordenamiento
+        sort_by = []
+        sort_info = {'sorted': False, 'columns': []}
+        
+        if sort_columns:
+            # Usar columnas especificadas por el usuario
+            sort_by = [col for col in sort_columns if col in common_cols]
+        elif auto_sort:
+            # Auto-detectar columnas para ordenar
+            sort_by = self._detect_sort_columns(df1_c, df2_c)
+        
+        # Aplicar ordenamiento si hay columnas identificadas
+        if sort_by:
+            try:
+                # Ordenar ambos DataFrames por las mismas columnas
+                df1_c = df1_c.sort_values(by=sort_by, na_position='last').reset_index(drop=True)
+                df2_c = df2_c.sort_values(by=sort_by, na_position='last').reset_index(drop=True)
+                sort_info = {'sorted': True, 'columns': sort_by}
+            except Exception as e:
+                # Si falla el ordenamiento, continuar sin ordenar
+                sort_info = {'sorted': False, 'columns': sort_by, 'error': str(e)}
+                df1_c = df1_c.reset_index(drop=True)
+                df2_c = df2_c.reset_index(drop=True)
+        else:
+            df1_c = df1_c.reset_index(drop=True)
+            df2_c = df2_c.reset_index(drop=True)
+        
         min_len = min(len(df1_c), len(df2_c))
 
         result: Dict[str, Any] = {
@@ -242,6 +431,7 @@ class ExcelAnalyzer:
             'column_differences': {},
             'diff_rows': [],              # up to MAX_DIFF_ROWS_STORED cells
             'diff_rows_total': 0,         # real total before cap
+            'sort_info': sort_info,       # información sobre el ordenamiento aplicado
         }
 
         if min_len == 0:
@@ -267,8 +457,8 @@ class ExcelAnalyzer:
                     index=s1.index,
                 )
             else:
-                n1 = s1.apply(lambda v: self._normalize_value(v, case_sensitive))
-                n2 = s2.apply(lambda v: self._normalize_value(v, case_sensitive))
+                n1 = s1.apply(lambda v: self._normalize_value(v, case_sensitive, ignore_type_diff))
+                n2 = s2.apply(lambda v: self._normalize_value(v, case_sensitive, ignore_type_diff))
                 both_nan = n1.isna() & n2.isna()
                 diff_mask = (n1 != n2) & ~both_nan
 
@@ -405,6 +595,29 @@ HTML_TEMPLATE = '''
                     <input type="checkbox" id="caseSensitive" checked>
                     Comparación sensible a mayúsculas/minúsculas
                 </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" id="autoSort" checked>
+                    Ordenar datos automáticamente antes de comparar
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" id="ignoreTypeDiff" checked>
+                    Ignorar diferencias de tipo (comparar solo valores)
+                </label>
+            </div>
+            
+            <div id="sortColumnsSection" style="display:none; margin: 16px 0; padding: 14px; background: #f0f2ff; border-radius: 6px;">
+                <p style="margin-bottom: 8px; font-weight: 600; color: #555;">
+                    <span style="color: #667eea;">✓</span> Columnas sugeridas para ordenar:
+                </p>
+                <div id="suggestedColumns" style="margin-bottom: 12px; font-size: .9em; color: #666;"></div>
+                <p style="margin: 8px 0; font-size: .9em; color: #666;">
+                    Puedes personalizar las columnas de ordenamiento (separadas por comas):
+                </p>
+                <input type="text" id="sortColumnsInput" placeholder="Ejemplo: ID, Código, Fecha" 
+                       style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-size: .9em;">
+                <p style="margin-top: 6px; font-size: .85em; color: #888;">
+                    💡 Esto permite comparar archivos con los mismos datos pero en diferente orden
+                </p>
             </div>
 
             <div>
@@ -454,6 +667,46 @@ function updateFileList() {
     });
     document.getElementById('singleBtn').disabled  = selectedFiles.length === 0;
     document.getElementById('compareBtn').disabled = selectedFiles.length !== 2;
+    
+    // Obtener columnas comunes si hay 2 archivos
+    if (selectedFiles.length === 2) {
+        fetchCommonColumns();
+    } else {
+        document.getElementById('sortColumnsSection').style.display = 'none';
+    }
+}
+
+function fetchCommonColumns() {
+    const fd = new FormData();
+    fd.append('file1', selectedFiles[0]);
+    fd.append('file2', selectedFiles[1]);
+    
+    fetch('/get-common-columns', { method:'POST', body:fd })
+        .then(r => r.json())
+        .then(d => {
+            if (d.error) {
+                console.error('Error obteniendo columnas:', d.error);
+                return;
+            }
+            
+            const section = document.getElementById('sortColumnsSection');
+            const suggestedDiv = document.getElementById('suggestedColumns');
+            const input = document.getElementById('sortColumnsInput');
+            
+            if (d.suggested_columns && d.suggested_columns.length > 0) {
+                suggestedDiv.innerHTML = '<strong style="color: #667eea;">' + 
+                    d.suggested_columns.join(', ') + '</strong>';
+                input.value = d.suggested_columns.join(', ');
+                section.style.display = 'block';
+            } else {
+                suggestedDiv.innerHTML = '<em>No se detectaron columnas automáticamente. Puedes especificarlas manualmente abajo.</em>';
+                input.value = '';
+                section.style.display = 'block';
+            }
+        })
+        .catch(e => {
+            console.error('Error:', e);
+        });
 }
 
 function showLoading()  { document.getElementById('loading').style.display = 'block'; }
@@ -481,6 +734,14 @@ function doCompare() {
     fd.append('file1', selectedFiles[0]);
     fd.append('file2', selectedFiles[1]);
     fd.append('case_sensitive', document.getElementById('caseSensitive').checked ? '1' : '0');
+    fd.append('auto_sort', document.getElementById('autoSort').checked ? '1' : '0');
+    fd.append('ignore_type_diff', document.getElementById('ignoreTypeDiff').checked ? '1' : '0');
+    
+    const sortCols = document.getElementById('sortColumnsInput').value.trim();
+    if (sortCols) {
+        fd.append('sort_columns', sortCols);
+    }
+    
     fetch('/compare', { method:'POST', body:fd })
         .then(r => r.json())
         .then(d => { hideLoading(); d.error ? showError(d.error) : displayComparison(d); })
@@ -537,12 +798,33 @@ function displayComparison(data) {
     const caseNote = data.case_sensitive
         ? '<small style="color:#888">Modo: sensible a mayúsculas</small>'
         : '<small style="color:#e65100">Modo: ignora mayúsculas</small>';
+    
+    const ignoreTypeNote = data.ignore_type_diff
+        ? '<small style="color:#2e7d32">✓ Ignorando diferencias de tipo (comparando solo valores)</small>'
+        : '';
 
     let html = `<div class="results">
         <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px">
             <h3 style="color:#333">Comparación: <em>${esc(data.file1)}</em> vs <em>${esc(data.file2)}</em></h3>
-            ${caseNote}
+            <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;">
+                ${caseNote}
+                ${ignoreTypeNote}
+            </div>
         </div>`;
+
+    // Sort info
+    if (dataDiff.sort_info && dataDiff.sort_info.sorted) {
+        const sortCols = dataDiff.sort_info.columns.join(', ');
+        html += `<div class="success" style="margin-top: 12px;">
+            ✓ Datos ordenados antes de comparar por: <strong>${esc(sortCols)}</strong>
+            <br><small>Esto permite detectar los mismos datos independientemente del orden de las filas</small>
+        </div>`;
+    } else if (dataDiff.sort_info && dataDiff.sort_info.columns && dataDiff.sort_info.columns.length > 0) {
+        html += `<div class="warning-box">
+            ⚠ No se pudo ordenar por las columnas especificadas: ${esc(dataDiff.sort_info.columns.join(', '))}
+            ${dataDiff.sort_info.error ? '<br><small>Error: ' + esc(dataDiff.sort_info.error) + '</small>' : ''}
+        </div>`;
+    }
 
     // Warnings
     (data.warnings||[]).forEach(w => {
@@ -829,13 +1111,70 @@ def analyze_single():
     if not f.filename:
         return jsonify({'error': 'No file selected'}), 400
 
-    path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(f.filename))
+    secure_name = secure_filename(f.filename) or 'file.xlsx'
+    unique_name = f"{uuid.uuid4().hex}_{secure_name}"
+    path = os.path.normpath(os.path.join(app.config['UPLOAD_FOLDER'], unique_name))
+    
     f.save(path)
     try:
+        # Verificar que el archivo existe
+        if not os.path.exists(path):
+            return jsonify({'error': 'Error al guardar el archivo temporal'}), 500
         return jsonify(analyzer.analyze_single_file(path))
     finally:
         if os.path.exists(path):
             os.remove(path)
+
+
+@app.route('/get-common-columns', methods=['POST'])
+def get_common_columns():
+    if 'file1' not in request.files or 'file2' not in request.files:
+        return jsonify({'error': 'Se requieren 2 archivos'}), 400
+
+    f1 = request.files['file1']
+    f2 = request.files['file2']
+
+    req_id = uuid.uuid4().hex
+    secure_name1 = secure_filename(f1.filename) or 'file1.xlsx'
+    secure_name2 = secure_filename(f2.filename) or 'file2.xlsx'
+    p1 = os.path.normpath(os.path.join(app.config['UPLOAD_FOLDER'], f"{req_id}_1_{secure_name1}"))
+    p2 = os.path.normpath(os.path.join(app.config['UPLOAD_FOLDER'], f"{req_id}_2_{secure_name2}"))
+
+    f1.save(p1)
+    f2.save(p2)
+    try:
+        if not os.path.exists(p1) or not os.path.exists(p2):
+            return jsonify({'error': 'Error al guardar los archivos temporales'}), 500
+
+        df1 = pd.read_excel(p1)
+        df2 = pd.read_excel(p2)
+
+        df1 = analyzer._preprocess_dataframe(df1, '')
+        df2 = analyzer._preprocess_dataframe(df2, '')
+        
+        common_cols = sorted(set(df1.columns) & set(df2.columns))
+        suggested_cols = analyzer._detect_sort_columns(df1, df2)
+        return jsonify({
+            'common_columns': common_cols,
+            'suggested_columns': suggested_cols
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        import time
+        import gc
+        gc.collect()
+        time.sleep(0.1)
+        for p in (p1, p2):
+            if os.path.exists(p):
+                max_attempts = 3
+                for attempt in range(max_attempts):
+                    try:
+                        os.remove(p)
+                        break
+                    except PermissionError:
+                        if attempt < max_attempts - 1:
+                            time.sleep(0.5)
 
 
 @app.route('/compare', methods=['POST'])
@@ -846,17 +1185,37 @@ def compare():
     f1 = request.files['file1']
     f2 = request.files['file2']
     case_sensitive = request.form.get('case_sensitive', '1') != '0'
+    auto_sort = request.form.get('auto_sort', '1') != '0'
+    ignore_type_diff = request.form.get('ignore_type_diff', '0') != '0'
+    
+    # Obtener columnas de ordenamiento si se especificaron
+    sort_columns_str = request.form.get('sort_columns', '')
+    sort_columns = [col.strip() for col in sort_columns_str.split(',') if col.strip()] if sort_columns_str else None
 
-    p1 = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(f1.filename))
-    p2 = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(f2.filename))
+    req_id = uuid.uuid4().hex
+    secure_name1 = secure_filename(f1.filename) or 'file1.xlsx'
+    secure_name2 = secure_filename(f2.filename) or 'file2.xlsx'
+    p1 = os.path.normpath(os.path.join(app.config['UPLOAD_FOLDER'], f"{req_id}_1_{secure_name1}"))
+    p2 = os.path.normpath(os.path.join(app.config['UPLOAD_FOLDER'], f"{req_id}_2_{secure_name2}"))
 
-    f1.save(p1)
-    f2.save(p2)
     try:
-        result = analyzer.compare_files(p1, p2, case_sensitive=case_sensitive)
+        f1.save(p1)
+        f2.save(p2)
+        
+        # Verificar que los archivos existen antes de procesarlos
+        if not os.path.exists(p1):
+            return jsonify({'error': f'No se pudo guardar el archivo: {f1.filename}'}), 500
+        if not os.path.exists(p2):
+            return jsonify({'error': f'No se pudo guardar el archivo: {f2.filename}'}), 500
+        
+        result = analyzer.compare_files(p1, p2, case_sensitive=case_sensitive,
+                                       sort_columns=sort_columns, auto_sort=auto_sort,
+                                       ignore_type_diff=ignore_type_diff)
         return jsonify(result)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        import traceback
+        error_msg = f'{str(e)}\n\nRuta archivo 1: {p1}\nRuta archivo 2: {p2}'
+        return jsonify({'error': error_msg, 'traceback': traceback.format_exc()}), 500
     finally:
         # Dar tiempo para que se liberen los recursos del archivo
         import time
@@ -886,6 +1245,9 @@ def download_report():
     if not comp_id:
         return 'ID de comparación requerido', 400
 
+    # Asegurar que la base de datos y tabla existen
+    analyzer._ensure_db()
+    
     conn = sqlite3.connect(analyzer.db_path)
     row = conn.execute(
         'SELECT data FROM comparisons WHERE id = ?', (comp_id,)
