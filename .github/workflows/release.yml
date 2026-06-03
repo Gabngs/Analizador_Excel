@@ -96,20 +96,20 @@ jobs:
             - **Linux**: `ExcelAnalyzer-linux-x64`
             - **macOS**: `ExcelAnalyzer-macos-x64`
 
-            ### ✨ Características:
-            - Análisis individual de archivos Excel
-            - Comparación de 2 archivos
-            - Detección de diferencias
-            - Interfaz web intuitiva
-            - Optimizado para archivos grandes
+            ### ✨ Novedades en ${{ github.ref_name }}:
+            - 🌐 El navegador se abre automáticamente al ejecutar
+            - ⏹ Botón "Cerrar Aplicación" en la interfaz web
+            - 🔍 Detección automática de fila de encabezados (archivos con títulos o metadatos antes de los datos)
+            - 📄 Informe descargable completamente rediseñado: diagnóstico en lenguaje natural, tipo de cambio por celda (valor modificado / vacío→dato / dato→vacío), resumen por columna
+            - 🏷 Nombres de archivo limpios en informes (sin prefijo UUID temporal)
 
             ### 🚀 Uso:
             1. Descarga el ejecutable para tu sistema operativo
-            2. Ejecuta el archivo
-            3. Abre tu navegador en `http://localhost:5000`
+            2. Ejecuta el archivo — el navegador se abre solo en `http://localhost:5000`
+            3. En Linux/macOS primero ejecuta: `chmod +x ExcelAnalyzer-*`
 
             ### 📝 Notas:
-            - En Linux/macOS, necesitas dar permisos de ejecución: `chmod +x ExcelAnalyzer-*`
-            - El servidor se ejecuta en el puerto 5000 por defecto
+            - El servidor corre en el puerto 5000
+            - Usa el botón **Cerrar Aplicación** en la web para detener el servidor
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

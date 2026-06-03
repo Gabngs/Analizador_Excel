@@ -4,7 +4,9 @@ import sys
 import json
 import sqlite3
 import tempfile
+import threading
 import uuid
+import webbrowser
 from pathlib import Path
 from typing import Dict, List, Any
 import pandas as pd
@@ -82,6 +84,70 @@ class ExcelAnalyzer:
 
         return df
 
+    # ------------------------------------------------------------------
+    # Smart Excel reader — auto-detects the real header row
+    # ------------------------------------------------------------------
+
+    def _find_header_row(self, df_raw: pd.DataFrame) -> int:
+        """Return the 0-based row index that best serves as column headers.
+
+        Scans the first 20 rows looking for a row where all non-empty cells
+        are strings (text labels), the row is well-filled, and the next row
+        actually contains data.  Falls back to 0 if nothing scores well enough.
+        """
+        total_cols = len(df_raw.columns)
+        max_check = min(20, max(0, len(df_raw) - 1))
+
+        best_row = 0
+        best_score = -1.0
+
+        for i in range(max_check):
+            row_vals = df_raw.iloc[i].tolist()
+            non_null = [v for v in row_vals if pd.notna(v) and str(v).strip() != '']
+
+            if len(non_null) < max(2, total_cols * 0.15):
+                continue  # too sparse to be a header
+
+            if not all(isinstance(v, str) for v in non_null):
+                continue  # real header rows contain only text labels
+
+            fill_ratio   = len(non_null) / total_cols
+            unique_ratio = len(set(non_null)) / len(non_null)
+
+            has_data_after = False
+            for j in range(i + 1, min(i + 3, len(df_raw))):
+                next_row = [v for v in df_raw.iloc[j].tolist()
+                            if pd.notna(v) and str(v).strip() != '']
+                if len(next_row) >= len(non_null) * 0.4:
+                    has_data_after = True
+                    break
+
+            score = fill_ratio * 0.5 + unique_ratio * 0.3 + (0.2 if has_data_after else 0.0)
+
+            if score > best_score:
+                best_score = score
+                best_row = i
+
+        return best_row
+
+    def _smart_read_excel(self, file_path: str) -> pd.DataFrame:
+        """Read an Excel file with automatic header-row detection.
+
+        Reads the first 30 rows raw to find the real header, then re-reads
+        the full file with the correct ``header`` parameter for proper dtype
+        inference.
+        """
+        df_raw = pd.read_excel(file_path, header=None, nrows=30)
+        header_row = self._find_header_row(df_raw)
+        return pd.read_excel(file_path, header=header_row)
+
+    @staticmethod
+    def _clean_display_name(file_path: str) -> str:
+        """Remove the UUID temp prefix added by Flask routes from a filename."""
+        name = Path(file_path).name
+        # Pattern: 32 hex chars + optional _1_ or _2_ separator
+        return re.sub(r'^[0-9a-f]{32}_\d?_?', '', name)
+
     def _init_db(self):
         """Inicializa la base de datos SQLite, verificando que la tabla existe."""
         try:
@@ -131,13 +197,13 @@ class ExcelAnalyzer:
         except Exception as e:
             return {'error': str(e)}
 
-    def analyze_single_file(self, file_path: str) -> Dict[str, Any]:
+    def analyze_single_file(self, file_path: str, display_name: str = None) -> Dict[str, Any]:
         try:
-            df = pd.read_excel(file_path)
+            df = self._smart_read_excel(file_path)
             df = self._preprocess_dataframe(df)
 
             metrics = {
-                'file_name': Path(file_path).name,
+                'file_name': display_name or self._clean_display_name(file_path),
                 'rows': len(df),
                 'columns': len(df.columns),
                 'column_names': df.columns.tolist(),
@@ -180,11 +246,12 @@ class ExcelAnalyzer:
 
     def compare_files(
         self, file1_path: str, file2_path: str, case_sensitive: bool = True,
-        sort_columns: List[str] = None, auto_sort: bool = True, ignore_type_diff: bool = True
+        sort_columns: List[str] = None, auto_sort: bool = True, ignore_type_diff: bool = True,
+        file1_name: str = None, file2_name: str = None,
     ) -> Dict[str, Any]:
         try:
-            df1 = pd.read_excel(file1_path)
-            df2 = pd.read_excel(file2_path)
+            df1 = self._smart_read_excel(file1_path)
+            df2 = self._smart_read_excel(file2_path)
 
             df1 = self._preprocess_dataframe(df1)
             df2 = self._preprocess_dataframe(df2)
@@ -220,8 +287,8 @@ class ExcelAnalyzer:
 
             comparison = {
                 'id': comp_id,
-                'file1': Path(file1_path).name,
-                'file2': Path(file2_path).name,
+                'file1': file1_name or self._clean_display_name(file1_path),
+                'file2': file2_name or self._clean_display_name(file2_path),
                 'timestamp': pd.Timestamp.now().isoformat(),
                 'case_sensitive': case_sensitive,
                 'ignore_type_diff': ignore_type_diff,
@@ -397,12 +464,14 @@ class ExcelAnalyzer:
         sort_by = []
         sort_info = {'sorted': False, 'columns': []}
         
-        if sort_columns:
-            # Usar columnas especificadas por el usuario
-            sort_by = [col for col in sort_columns if col in common_cols]
-        elif auto_sort:
-            # Auto-detectar columnas para ordenar
-            sort_by = self._detect_sort_columns(df1_c, df2_c)
+        # Solo ordenar si auto_sort está activado
+        if auto_sort:
+            if sort_columns:
+                # Usar columnas especificadas por el usuario
+                sort_by = [col for col in sort_columns if col in common_cols]
+            else:
+                # Auto-detectar columnas para ordenar
+                sort_by = self._detect_sort_columns(df1_c, df2_c)
         
         # Aplicar ordenamiento si hay columnas identificadas
         if sort_by:
@@ -525,7 +594,8 @@ HTML_TEMPLATE = '''
         .button:hover { transform: translateY(-2px); box-shadow: 0 10px 20px rgba(102,126,234,.3); }
         .button:disabled { opacity: .6; cursor: not-allowed; transform: none; }
         .button-sm { padding: 8px 18px; font-size: .9em; }
-        .button-green { background: linear-gradient(135deg, #43a047 0%, #1b5e20 100%); }
+        .button-green  { background: linear-gradient(135deg, #43a047 0%, #1b5e20 100%); }
+        .button-danger { background: linear-gradient(135deg, #e53935 0%, #b71c1c 100%); }
         .file-list { list-style: none; margin: 20px 0; }
         .file-item { background: #f8f9ff; padding: 12px; margin: 8px 0; border-radius: 6px; display: flex; justify-content: space-between; align-items: center; }
         .file-item span { color: #333; font-weight: 500; }
@@ -575,6 +645,9 @@ HTML_TEMPLATE = '''
     <div class="header">
         <h1>&#128202; Excel Analyzer</h1>
         <p>Compara y analiza archivos Excel con precisión</p>
+        <button class="button button-danger" style="margin-top:18px;font-size:.9em" onclick="shutdownApp()">
+            &#9209; Cerrar Aplicación
+        </button>
     </div>
 
     <div class="content">
@@ -638,6 +711,17 @@ HTML_TEMPLATE = '''
 <script>
 let selectedFiles = [];
 const uploadArea = document.getElementById('uploadArea');
+
+function shutdownApp() {
+    if (!confirm('¿Cerrar la aplicación y el servidor?')) return;
+    fetch('/shutdown', { method: 'POST' })
+        .finally(() => {
+            document.body.innerHTML =
+                '<div style="display:flex;align-items:center;justify-content:center;height:100vh;' +
+                'font-family:sans-serif;color:#555;font-size:1.3em;">' +
+                'Aplicación cerrada. Puedes cerrar esta pestaña.</div>';
+        });
+}
 
 function handleDragOver(e) { e.preventDefault(); uploadArea.classList.add('dragover'); }
 function handleDragLeave(e) { uploadArea.classList.remove('dragover'); }
@@ -942,152 +1026,344 @@ function displayComparison(data) {
 # Download report generator
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _report_schema_rows(schema: dict) -> str:
-    rows = ''
-    for col in schema.get('only_in_file1', []):
-        rows += f'<tr><td>{col}</td><td class="y">Solo en Archivo 1</td><td>—</td></tr>'
-    for col in schema.get('only_in_file2', []):
-        rows += f'<tr><td>{col}</td><td class="y">Solo en Archivo 2</td><td>—</td></tr>'
-    for col, chg in schema.get('type_changes', {}).items():
-        rows += f'<tr><td>{col}</td><td class="y">Cambio de tipo</td><td>{chg["from"]} → {chg["to"]}</td></tr>'
-    return rows
+_REPORT_CSS = '''
+  *, *::before, *::after { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+         margin: 0; background: #f0f2f5; color: #222; line-height: 1.5; }
+  .page { max-width: 1150px; margin: 0 auto; padding: 30px 20px 60px; }
+  h1 { color: #3949ab; font-size: 1.8em; margin: 0 0 4px; }
+  .subtitle { color: #888; font-size: .9em; margin-bottom: 22px; }
+  h2 { font-size: 1.15em; color: #3949ab; border-left: 4px solid #3949ab;
+       padding: 7px 14px; margin: 34px 0 14px; background: #e8eaf6;
+       border-radius: 0 6px 6px 0; }
+  .card-row { display: flex; flex-wrap: wrap; gap: 12px; margin: 14px 0; }
+  .card { background: white; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.1);
+          padding: 14px 20px; flex: 1; min-width: 140px; }
+  .card .lbl { font-size: .75em; color: #888; text-transform: uppercase;
+               letter-spacing: .05em; margin-bottom: 4px; }
+  .card .val { font-size: 1.8em; font-weight: 700; color: #3949ab; }
+  .card .val.red    { color: #c62828; }
+  .card .val.green  { color: #2e7d32; }
+  .card .val.orange { color: #e65100; }
+  .card .sub { font-size: .78em; color: #777; margin-top: 3px; }
+  .status-badge { display: inline-flex; align-items: center; gap: 8px;
+                  padding: 8px 18px; border-radius: 20px; font-weight: 600;
+                  font-size: .97em; margin-bottom: 14px; }
+  .status-ok     { background: #e8f5e9; color: #2e7d32; border: 1px solid #a5d6a7; }
+  .status-issues { background: #ffebee; color: #c62828; border: 1px solid #ef9a9a; }
+  .diagnosis { list-style: none; margin: 0; padding: 0; }
+  .diagnosis li { padding: 10px 16px; border-radius: 6px; margin-bottom: 8px;
+                  font-size: .95em; line-height: 1.6; }
+  .ok-item    { background: #e8f5e9; border-left: 4px solid #43a047; color: #1b5e20; }
+  .issue-item { background: #fff8e1; border-left: 4px solid #f9a825; color: #4a3000; }
+  .warn { background: #fff8e1; border-left: 4px solid #f9a825; padding: 10px 14px;
+          border-radius: 4px; margin: 8px 0; color: #6d4c00; font-size: .9em; }
+  .info { background: #e3f2fd; border-left: 4px solid #1976d2; padding: 10px 14px;
+          border-radius: 4px; margin: 8px 0; color: #0d47a1; font-size: .9em; }
+  .meta-box { background: white; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.1);
+              padding: 14px 20px; margin-bottom: 20px; }
+  .meta-box table { box-shadow: none !important; border-radius: 0 !important;
+                    margin: 0; width: auto; }
+  .meta-box td { padding: 3px 16px 3px 0; border: none !important; background: transparent !important;
+                 font-size: .92em; }
+  .meta-box td:first-child { font-weight: 600; color: #555; white-space: nowrap; }
+  .section-wrap { background: white; border-radius: 8px;
+                  box-shadow: 0 1px 4px rgba(0,0,0,.1); padding: 20px; margin-bottom: 20px; }
+  .col-lists { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+               gap: 14px; margin-top: 14px; }
+  .col-group { border: 1px solid #e0e0e0; border-radius: 8px; padding: 14px; }
+  .col-group h4 { margin: 0 0 10px; font-size: .82em; text-transform: uppercase;
+                  letter-spacing: .04em; color: #555; }
+  .pill { display: inline-block; border-radius: 4px; padding: 2px 9px; margin: 2px; font-size: .82em; }
+  .pill-miss   { background: #ffebee; border: 1px solid #ef9a9a; color: #c62828; }
+  .pill-extra  { background: #e8f5e9; border: 1px solid #a5d6a7; color: #2e7d32; }
+  .pill-common { background: #e8eaf6; border: 1px solid #9fa8da; color: #3949ab; }
+  table { width: 100%; border-collapse: collapse; background: white; font-size: .88em;
+          box-shadow: 0 1px 4px rgba(0,0,0,.1); border-radius: 8px; overflow: hidden; }
+  thead th { background: #3949ab; color: white; padding: 10px 14px; text-align: left;
+             font-weight: 600; white-space: nowrap; }
+  tbody tr:nth-child(even) { background: #fafafa; }
+  tbody tr:hover { background: #f0f2ff; }
+  td { padding: 8px 14px; border-bottom: 1px solid #eee; vertical-align: top; }
+  tbody tr:last-child td { border-bottom: none; }
+  td.row-num  { font-family: monospace; color: #888; font-size: .85em; white-space: nowrap; }
+  td.val-old  { background: #fff3e0 !important; color: #bf360c; font-weight: 500; }
+  td.val-new  { background: #e8f5e9 !important; color: #1b5e20; font-weight: 500; }
+  td.val-null { color: #bbb; font-style: italic; }
+  td.cnt      { font-weight: 700; color: #c62828; text-align: right; }
+  .badge { display: inline-block; padding: 2px 9px; border-radius: 10px;
+           font-size: .78em; font-weight: 600; white-space: nowrap; }
+  .b-mod  { background: #fff3e0; color: #e65100; }
+  .b-fill { background: #e8f5e9; color: #2e7d32; }
+  .b-clr  { background: #ffebee; color: #c62828; }
+  .trunc { background: #fff3e0; border-left: 4px solid #ff9800; padding: 10px 14px;
+           border-radius: 4px; margin-bottom: 12px; font-size: .9em; color: #6d4c00; }
+  @media print { body { background: white; } .page { padding: 0; } }
+'''
 
 
-def _report_col_rows(col_diffs: dict, rows_compared: int) -> str:
+def _rpt_structure(schema: dict, metrics: dict, file1: str, file2: str) -> str:
+    only1  = schema.get('only_in_file1', [])
+    only2  = schema.get('only_in_file2', [])
+    common = schema.get('common_columns', [])
+    row_diff = metrics.get('row_difference', 0)
+    r1 = metrics.get('file1_rows', 0)
+    r2 = metrics.get('file2_rows', 0)
+
+    if row_diff < 0:
+        diff_sub = f'Faltan {abs(row_diff)} fila(s) en Archivo 2'
+        diff_cls = 'red'
+    elif row_diff > 0:
+        diff_sub = f'Sobran {row_diff} fila(s) en Archivo 2'
+        diff_cls = 'orange'
+    else:
+        diff_sub = 'Mismo n&uacute;mero de filas'
+        diff_cls = 'green'
+
+    excl = len(only1) + len(only2)
+    html = (
+        f'<div class="section-wrap"><div class="card-row">'
+        f'<div class="card"><div class="lbl">Filas en Archivo 1</div>'
+        f'<div class="val">{r1:,}</div></div>'
+        f'<div class="card"><div class="lbl">Filas en Archivo 2</div>'
+        f'<div class="val">{r2:,}</div></div>'
+        f'<div class="card"><div class="lbl">Diferencia de filas</div>'
+        f'<div class="val {diff_cls}">{row_diff:+}</div>'
+        f'<div class="sub">{diff_sub}</div></div>'
+        f'<div class="card"><div class="lbl">Columnas comunes</div>'
+        f'<div class="val">{len(common)}</div></div>'
+        f'<div class="card"><div class="lbl">Columnas exclusivas</div>'
+        f'<div class="val {"orange" if excl else "green"}">{excl}</div>'
+        f'<div class="sub">{"Solo en un archivo" if excl else "Ninguna"}</div></div>'
+        f'</div><div class="col-lists">'
+    )
+    if only1:
+        pills = ''.join(f'<span class="pill pill-miss">&#10060; {c}</span>' for c in only1)
+        html += (
+            f'<div class="col-group"><h4>&#10060; Falta en Archivo 2 &mdash; {len(only1)} columna(s)</h4>'
+            f'{pills}</div>'
+        )
+    if only2:
+        pills = ''.join(f'<span class="pill pill-extra">&#10133; {c}</span>' for c in only2)
+        html += (
+            f'<div class="col-group"><h4>&#10133; Nueva en Archivo 2 &mdash; {len(only2)} columna(s)</h4>'
+            f'{pills}</div>'
+        )
+    if common:
+        pills = ''.join(f'<span class="pill pill-common">{c}</span>' for c in common[:60])
+        more = (
+            f'<span style="color:#888;font-size:.82em"> &hellip; y {len(common)-60} m&aacute;s</span>'
+            if len(common) > 60 else ''
+        )
+        html += (
+            f'<div class="col-group"><h4>&#10003; Columnas comunes &mdash; {len(common)}</h4>'
+            f'{pills}{more}</div>'
+        )
+    html += '</div></div>'
+    return html
+
+
+def _rpt_col_summary(col_diffs: dict, rows_compared: int, diff_rows: list) -> str:
+    type_counts: Dict[str, Dict[str, int]] = {}
+    for r in diff_rows:
+        col = r['col']
+        if col not in type_counts:
+            type_counts[col] = {'modified': 0, 'filled': 0, 'cleared': 0}
+        if r.get('null1') and not r.get('null2'):
+            type_counts[col]['filled'] += 1
+        elif not r.get('null1') and r.get('null2'):
+            type_counts[col]['cleared'] += 1
+        else:
+            type_counts[col]['modified'] += 1
+
     rows = ''
     for col, cnt in sorted(col_diffs.items(), key=lambda x: -x[1]):
-        pct = f'{cnt / rows_compared * 100:.1f}%' if rows_compared else '?'
-        rows += f'<tr><td>{col}</td><td class="diff">{cnt}</td><td>{pct}</td></tr>'
-    return rows
-
-
-def _report_data_rows(diff_rows: list) -> str:
-    rows = ''
-    for r in diff_rows:
-        n1 = ' class="null"' if r.get('null1') else ''
-        n2 = ' class="null diff"' if r.get('null2') else ' class="diff"'
+        pct = f'{cnt / rows_compared * 100:.1f}%' if rows_compared else '&mdash;'
+        tc  = type_counts.get(col, {})
+        mod = tc.get('modified', 0)
+        fil = tc.get('filled',   0)
+        clr = tc.get('cleared',  0)
         rows += (
-            f'<tr>'
-            f'<td class="mono">{r["row_excel"]}</td>'
-            f'<td><b>{r["col"]}</b></td>'
-            f'<td{n1}>{r["val1"]}</td>'
-            f'<td{n2}>{r["val2"]}</td>'
+            f'<tr><td><strong>{col}</strong></td>'
+            f'<td class="cnt">{cnt}</td><td>{pct}</td>'
+            f'<td>{"<span class=badge b-mod>" + str(mod) + " valor(es)</span>" if mod else "&mdash;"}</td>'
+            f'<td>{"<span class=badge b-fill>" + str(fil) + " celda(s)</span>" if fil else "&mdash;"}</td>'
+            f'<td>{"<span class=badge b-clr>" + str(clr) + " celda(s)</span>" if clr else "&mdash;"}</td>'
             f'</tr>'
         )
-    return rows
+    return (
+        '<div class="section-wrap"><div style="overflow-x:auto"><table>'
+        '<thead><tr>'
+        '<th>Columna</th><th>Celdas distintas</th><th>% comparadas</th>'
+        '<th>Valor modificado</th><th>Vac&iacute;o &rarr; dato</th><th>Dato &rarr; vac&iacute;o</th>'
+        '</tr></thead>'
+        f'<tbody>{rows}</tbody></table></div></div>'
+    )
 
 
-def _report_summary_cards(metrics: dict, schema: dict, dd: dict, total_cells: int) -> str:
-    def color(bad_condition: bool) -> str:
-        return 'red' if bad_condition else 'green'
-
-    row_diff = metrics.get('row_difference', 0)
-    return f'''<div class="summary">
-  <div class="card"><div class="lbl">Filas Archivo 1</div><div class="val">{metrics.get("file1_rows", 0)}</div></div>
-  <div class="card"><div class="lbl">Filas Archivo 2</div><div class="val">{metrics.get("file2_rows", 0)}</div></div>
-  <div class="card"><div class="lbl">Dif. Filas</div><div class="val {color(row_diff != 0)}">{row_diff:+}</div></div>
-  <div class="card"><div class="lbl">Cols. Comunes</div><div class="val">{schema.get("common_count", 0)}</div></div>
-  <div class="card"><div class="lbl">Cols. Diferentes</div><div class="val {color(schema.get("total_different", 0) > 0)}">{schema.get("total_different", 0)}</div></div>
-  <div class="card"><div class="lbl">Filas con Diffs</div><div class="val {color(dd.get("rows_with_differences", 0) > 0)}">{dd.get("rows_with_differences", 0)}</div></div>
-  <div class="card"><div class="lbl">Celdas Diferentes</div><div class="val {color(total_cells > 0)}">{total_cells}</div></div>
-</div>'''
+def _rpt_detail_table(diff_rows: list, total_cells: int, file1: str, file2: str) -> str:
+    trunc = ''
+    if total_cells > len(diff_rows):
+        trunc = (
+            f'<div class="trunc">&#9888; Se muestran <strong>{len(diff_rows):,}</strong> '
+            f'de <strong>{total_cells:,}</strong> diferencias totales.</div>'
+        )
+    rows = ''
+    for r in diff_rows:
+        null1, null2 = r.get('null1'), r.get('null2')
+        v1, v2 = r['val1'], r['val2']
+        if null1 and not null2:
+            badge = '<span class="badge b-fill">Vac&iacute;o &rarr; dato</span>'
+            c1, c2 = 'val-null', 'val-new'
+        elif not null1 and null2:
+            badge = '<span class="badge b-clr">Dato &rarr; vac&iacute;o</span>'
+            c1, c2 = 'val-old', 'val-null'
+        else:
+            badge = '<span class="badge b-mod">Valor modificado</span>'
+            c1, c2 = 'val-old', 'val-new'
+        rows += (
+            f'<tr>'
+            f'<td class="row-num">Fila&nbsp;{r["row_excel"]}</td>'
+            f'<td><strong>{r["col"]}</strong></td>'
+            f'<td>{badge}</td>'
+            f'<td class="{c1}">{v1}</td>'
+            f'<td class="{c2}">{v2}</td>'
+            f'</tr>'
+        )
+    return (
+        f'<div class="section-wrap">{trunc}'
+        f'<div style="overflow-x:auto"><table>'
+        f'<thead><tr>'
+        f'<th>Fila (Excel)</th><th>Columna</th><th>Tipo de cambio</th>'
+        f'<th>{file1}<br><small style="font-weight:400;opacity:.85">(valor anterior)</small></th>'
+        f'<th>{file2}<br><small style="font-weight:400;opacity:.85">(valor nuevo)</small></th>'
+        f'</tr></thead>'
+        f'<tbody>{rows}</tbody></table></div></div>'
+    )
 
 
 def _build_download_report(data: dict) -> str:
-    schema    = data.get('schema_differences', {})
-    dd        = data.get('data_differences', {})
-    metrics   = data.get('metrics', {})
-    diff_rows = dd.get('diff_rows', [])
-    col_diffs = dd.get('column_differences', {})
-
-    schema_rows = _report_schema_rows(schema)
-    col_rows    = _report_col_rows(col_diffs, dd.get('rows_compared', 0))
-    data_rows   = _report_data_rows(diff_rows)
-
-    warnings_html = ''.join(
-        f'<p class="warn">&#9888; {w}</p>' for w in data.get('warnings', [])
-    )
-
+    schema      = data.get('schema_differences', {})
+    dd          = data.get('data_differences', {})
+    metrics     = data.get('metrics', {})
+    diff_rows   = dd.get('diff_rows', [])
+    col_diffs   = dd.get('column_differences', {})
+    file1       = data.get('file1', 'Archivo 1')
+    file2       = data.get('file2', 'Archivo 2')
     total_cells = dd.get('diff_rows_total', len(diff_rows))
-    truncation_note = (
-        f'<p class="warn">Nota: se muestran {len(diff_rows)} de {total_cells} celdas diferentes (límite del informe).</p>'
-        if total_cells > len(diff_rows) else ''
+    rows_cmp    = dd.get('rows_compared', 0)
+    row_diff    = metrics.get('row_difference', 0)
+    only1       = schema.get('only_in_file1', [])
+    only2       = schema.get('only_in_file2', [])
+    rows_w_diff = dd.get('rows_with_differences', 0)
+
+    # ── Diagnóstico en lenguaje natural ─────────────────────────────────
+    issues: List[str] = []
+    if row_diff < 0:
+        issues.append(
+            f'<li class="issue-item">&#10060; <strong>Faltan {abs(row_diff)} fila(s)</strong> en Archivo 2 '
+            f'(Archivo&nbsp;1:&nbsp;{metrics.get("file1_rows",0):,}&nbsp;filas &mdash; '
+            f'Archivo&nbsp;2:&nbsp;{metrics.get("file2_rows",0):,}&nbsp;filas).</li>'
+        )
+    elif row_diff > 0:
+        issues.append(
+            f'<li class="issue-item">&#9888; <strong>Sobran {row_diff} fila(s)</strong> en Archivo 2 '
+            f'(Archivo&nbsp;1:&nbsp;{metrics.get("file1_rows",0):,}&nbsp;filas &mdash; '
+            f'Archivo&nbsp;2:&nbsp;{metrics.get("file2_rows",0):,}&nbsp;filas). '
+            f'Las filas extra no fueron comparadas.</li>'
+        )
+    for col in only1:
+        issues.append(
+            f'<li class="issue-item">&#10060; <strong>Columna faltante en Archivo 2:</strong> '
+            f'&laquo;{col}&raquo; &mdash; existe en Archivo 1 pero <strong>no aparece</strong> en Archivo 2.</li>'
+        )
+    for col in only2:
+        issues.append(
+            f'<li class="issue-item">&#10133; <strong>Columna nueva en Archivo 2:</strong> '
+            f'&laquo;{col}&raquo; &mdash; existe en Archivo 2 pero <strong>no aparece</strong> en Archivo 1.</li>'
+        )
+    if total_cells:
+        issues.append(
+            f'<li class="issue-item">&#128260; '
+            f'<strong>{total_cells:,} celda(s) con valor distinto</strong> en '
+            f'<strong>{rows_w_diff:,} fila(s)</strong> y '
+            f'<strong>{len(col_diffs)} columna(s)</strong>.</li>'
+        )
+
+    has_issues = bool(issues)
+    if not has_issues:
+        issues.append(
+            '<li class="ok-item">&#10003; Los archivos son <strong>id&eacute;nticos</strong> '
+            'en estructura y datos.</li>'
+        )
+
+    diagnosis_html = '<ul class="diagnosis">' + ''.join(issues) + '</ul>'
+    status_cls  = 'status-issues' if has_issues else 'status-ok'
+    status_text = (
+        f'&#9888;&nbsp;{len(issues)} hallazgo(s) encontrado(s)' if has_issues
+        else '&#10003;&nbsp;Sin diferencias'
     )
 
-    summary_cards = _report_summary_cards(metrics, schema, dd, total_cells)
+    warnings_html = ''.join(f'<div class="warn">&#9888; {w}</div>' for w in data.get('warnings', []))
+    sort_info = dd.get('sort_info', {})
+    sort_html = ''
+    if sort_info.get('sorted'):
+        sort_html = (
+            f'<div class="info">&#128260; Datos ordenados antes de comparar por: '
+            f'<strong>{", ".join(sort_info["columns"])}</strong></div>'
+        )
+    ts = data.get('timestamp', '?')[:19].replace('T', ' ')
+
+    structure_html   = _rpt_structure(schema, metrics, file1, file2)
+    col_summary_html = _rpt_col_summary(col_diffs, rows_cmp, diff_rows) if col_diffs else ''
+    detail_html      = _rpt_detail_table(diff_rows, total_cells, file1, file2) if diff_rows else ''
+    no_diff_html     = (
+        '<div class="section-wrap"><p style="color:#2e7d32;font-weight:600">'
+        '&#10003; Sin diferencias en los datos de columnas comunes.</p></div>'
+        if not diff_rows and not only1 and not only2 and not row_diff else ''
+    )
 
     return f'''<!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="UTF-8">
-<title>Informe de Comparación — {data.get("file1","?")} vs {data.get("file2","?")}</title>
-<style>
-  body {{ font-family: Arial, sans-serif; margin: 30px; background: #f9f9f9; color: #222; }}
-  h1 {{ color: #3949ab; }}
-  h2 {{ color: #555; border-bottom: 2px solid #667eea; padding-bottom: 6px; margin: 30px 0 14px; }}
-  .meta {{ background: #e8eaf6; border-radius: 6px; padding: 14px 20px; margin-bottom: 20px; font-size: .95em; }}
-  .meta p {{ margin: 4px 0; }}
-  .summary {{ display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 20px; }}
-  .card {{ background: white; border-left: 4px solid #667eea; border-radius: 6px; padding: 14px 20px; min-width: 140px; box-shadow: 0 1px 4px rgba(0,0,0,.1); }}
-  .card .lbl {{ font-size: .8em; color: #888; text-transform: uppercase; }}
-  .card .val {{ font-size: 1.7em; font-weight: bold; color: #3949ab; }}
-  .card .val.red {{ color: #c62828; }}
-  .card .val.green {{ color: #2e7d32; }}
-  table {{ width: 100%; border-collapse: collapse; background: white; font-size: .92em; margin-bottom: 16px; }}
-  th {{ background: #3949ab; color: white; padding: 9px 12px; text-align: left; }}
-  td {{ padding: 8px 12px; border-bottom: 1px solid #eee; }}
-  tr:nth-child(even) {{ background: #f5f5f5; }}
-  td.diff {{ background: #ffebee; color: #c62828; font-weight: 600; }}
-  td.null {{ color: #aaa; font-style: italic; }}
-  td.y    {{ color: #e65100; font-weight: 600; }}
-  td.mono {{ font-family: monospace; color: #888; }}
-  .warn {{ background: #fff8e1; border-left: 4px solid #f9a825; padding: 10px 14px; border-radius: 4px; margin: 8px 0; color: #6d4c00; }}
-  .ok   {{ background: #e8f5e9; border-left: 4px solid #43a047; padding: 10px 14px; border-radius: 4px; margin: 8px 0; color: #1b5e20; }}
-  @media print {{ body {{ margin: 10px; }} }}
-</style>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Informe &mdash; {file1} vs {file2}</title>
+<style>{_REPORT_CSS}</style>
 </head>
 <body>
-<h1>&#128202; Informe de Comparación Excel</h1>
+<div class="page">
 
-<div class="meta">
-  <p><strong>Archivo 1:</strong> {data.get("file1","?")}</p>
-  <p><strong>Archivo 2:</strong> {data.get("file2","?")}</p>
-  <p><strong>Fecha:</strong> {data.get("timestamp","?")}</p>
-  <p><strong>Sensible a mayúsculas:</strong> {"Sí" if data.get("case_sensitive") else "No"}</p>
+<h1>&#128202; Informe de Comparaci&oacute;n Excel</h1>
+<p class="subtitle">Generado el {ts}</p>
+
+<div class="meta-box">
+  <table>
+    <tr><td>Archivo 1:</td><td>{file1}</td></tr>
+    <tr><td>Archivo 2:</td><td>{file2}</td></tr>
+    <tr><td>Filas comparadas:</td><td>{rows_cmp:,}</td></tr>
+    <tr><td>Comparaci&oacute;n:</td><td>{"Sensible a may&uacute;sculas" if data.get("case_sensitive") else "Insensible a may&uacute;sculas"}</td></tr>
+  </table>
 </div>
 
-{warnings_html}
+{warnings_html}{sort_html}
 
-<h2>Resumen</h2>
-{summary_cards}
+<h2>&#128203; Diagn&oacute;stico General</h2>
+<div class="section-wrap">
+  <div class="{status_cls} status-badge">{status_text}</div>
+  {diagnosis_html}
+</div>
 
-{"" if not schema_rows else f"""
-<h2>Diferencias de Esquema</h2>
-<table><thead><tr><th>Columna</th><th>Diferencia</th><th>Detalle</th></tr></thead>
-<tbody>{schema_rows}</tbody></table>"""}
+<h2>&#128208; Estructura de Archivos</h2>
+{structure_html}
 
-{"" if not col_rows else f"""
-<h2>Celdas Diferentes por Columna</h2>
-<table><thead><tr><th>Columna</th><th>Celdas Diferentes</th><th>% sobre filas comparadas</th></tr></thead>
-<tbody>{col_rows}</tbody></table>"""}
+{"<h2>&#128202; Resumen de Cambios por Columna</h2>" + col_summary_html if col_summary_html else ""}
 
-{"" if not data_rows else f"""
-<h2>Detalle Celda por Celda</h2>
-{truncation_note}
-<table>
-  <thead>
-    <tr>
-      <th>Fila (Excel)</th>
-      <th>Columna</th>
-      <th>{data.get("file1","Archivo 1")}</th>
-      <th>{data.get("file2","Archivo 2")} (diferente)</th>
-    </tr>
-  </thead>
-  <tbody>{data_rows}</tbody>
-</table>"""}
+{"<h2>&#128269; Detalle Celda por Celda</h2>" + detail_html if detail_html else ""}
 
-{"<div class='ok'>&#10003; Los datos en columnas comunes son idénticos.</div>" if not col_rows and not schema_rows else ""}
+{no_diff_html}
 
+</div>
 </body>
 </html>'''
 
@@ -1119,7 +1395,7 @@ def analyze_single():
         # Verificar que el archivo existe
         if not os.path.exists(path):
             return jsonify({'error': 'Error al guardar el archivo temporal'}), 500
-        return jsonify(analyzer.analyze_single_file(path))
+        return jsonify(analyzer.analyze_single_file(path, display_name=f.filename or secure_name))
     finally:
         if os.path.exists(path):
             os.remove(path)
@@ -1145,8 +1421,8 @@ def get_common_columns():
         if not os.path.exists(p1) or not os.path.exists(p2):
             return jsonify({'error': 'Error al guardar los archivos temporales'}), 500
 
-        df1 = pd.read_excel(p1)
-        df2 = pd.read_excel(p2)
+        df1 = analyzer._smart_read_excel(p1)
+        df2 = analyzer._smart_read_excel(p2)
 
         df1 = analyzer._preprocess_dataframe(df1)
         df2 = analyzer._preprocess_dataframe(df2)
@@ -1207,9 +1483,15 @@ def compare():
         if not os.path.exists(p2):
             return jsonify({'error': f'No se pudo guardar el archivo: {f2.filename}'}), 500
         
-        result = analyzer.compare_files(p1, p2, case_sensitive=case_sensitive,
-                                       sort_columns=sort_columns, auto_sort=auto_sort,
-                                       ignore_type_diff=ignore_type_diff)
+        result = analyzer.compare_files(
+            p1, p2,
+            case_sensitive=case_sensitive,
+            sort_columns=sort_columns,
+            auto_sort=auto_sort,
+            ignore_type_diff=ignore_type_diff,
+            file1_name=f1.filename or secure_name1,
+            file2_name=f2.filename or secure_name2,
+        )
         return jsonify(result)
     except Exception as e:
         import traceback
@@ -1269,5 +1551,16 @@ def download_report():
     )
 
 
+@app.route('/shutdown', methods=['POST'])
+def shutdown():
+    def _stop():
+        import time as _t
+        _t.sleep(0.6)
+        os._exit(0)
+    threading.Thread(target=_stop, daemon=True).start()
+    return jsonify({'message': 'Cerrando aplicación...'})
+
+
 if __name__ == '__main__':
+    threading.Timer(1.5, lambda: webbrowser.open('http://127.0.0.1:5000')).start()
     app.run(debug=False, host='0.0.0.0', port=5000, threaded=True)
